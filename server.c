@@ -14,7 +14,9 @@
 #define PORT 8888
 #define USER_FILE "user.txt"
 #define BROADCAST_INTERVAL 5  // 在线列表广播间隔（秒）
+#define MAX_GROUPS 5          // 最大群数量
 
+// 客户端结构体
 typedef struct {
     int socket;
     char username[50];
@@ -22,9 +24,22 @@ typedef struct {
     int is_active;
 } Client;
 
+// 群聊结构体
+typedef struct {
+    int group_id;               // 群ID（唯一标识）
+    char group_name[50];        // 群名称
+    char members[10][50];       // 群成员用户名（最多10人）
+    int member_count;           // 群成员数量
+    int is_active;              // 群是否有效
+} Group;
+
+// 全局变量
 Client clients[MAX_CLIENTS];
+Group groups[MAX_GROUPS];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t groups_mutex = PTHREAD_MUTEX_INITIALIZER;
 int client_count = 0;
+int group_count = 0;
 
 // 检查用户名是否存在
 int user_exists(const char *username) {
@@ -92,13 +107,11 @@ void get_online_users(char *list) {
     pthread_mutex_lock(&clients_mutex);
     strcpy(list, "在线用户列表：\n");
     char temp[100];
-    // 记录已添加的用户名，避免重复
     char added_users[MAX_CLIENTS][50] = {0};
     int added_count = 0;
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].is_active) {
-            // 检查是否已添加
             int is_duplicate = 0;
             for (int j = 0; j < added_count; j++) {
                 if (strcmp(added_users[j], clients[i].username) == 0) {
@@ -135,7 +148,7 @@ void *broadcast_online_users(void *arg) {
     return NULL;
 }
 
-// 转发消息（新增发送者确认）
+// 转发私聊消息
 void forward_message(const char *message, const char *target_username, const char *sender_username, int sender_socket) {
     int target_index = find_client_index(target_username);
     if (target_index == -1) {
@@ -152,8 +165,128 @@ void forward_message(const char *message, const char *target_username, const cha
 
     // 发送确认给发送者
     char confirm_msg[BUFFER_SIZE];
-    snprintf(confirm_msg, BUFFER_SIZE, "已发送给 %s: %s", target_username, message);
-    send(sender_socket, confirm_msg, strlen(confirm_msg), 0);
+    //snprintf(confirm_msg, BUFFER_SIZE, "已发送给 %s: %s", target_username, message);
+    //send(sender_socket, confirm_msg, strlen(confirm_msg), 0);
+}
+
+// 创建群聊
+int create_group(const char *group_name, const char *creator) {
+    pthread_mutex_lock(&groups_mutex);
+    int group_idx = -1;
+    for (int i = 0; i < MAX_GROUPS; i++) {
+        if (!groups[i].is_active) {
+            group_idx = i;
+            break;
+        }
+    }
+    if (group_idx == -1) {
+        pthread_mutex_unlock(&groups_mutex);
+        return -1;  // 群数量达上限
+    }
+
+    // 初始化群信息
+    groups[group_idx].group_id = group_idx + 1;  // 群ID从1开始
+    strncpy(groups[group_idx].group_name, group_name, 49);  // 限制长度
+    groups[group_idx].group_name[49] = '\0';
+    strncpy(groups[group_idx].members[0], creator, 49);
+    groups[group_idx].members[0][49] = '\0';
+    groups[group_idx].member_count = 1;
+    groups[group_idx].is_active = 1;
+    group_count++;
+
+    pthread_mutex_unlock(&groups_mutex);
+    return groups[group_idx].group_id;
+}
+
+// 加入群聊
+int join_group(int group_id, const char *username) {
+    if (!user_exists(username)) return 0;
+
+    pthread_mutex_lock(&groups_mutex);
+    int group_idx = -1;
+    for (int i = 0; i < MAX_GROUPS; i++) {
+        if (groups[i].is_active && groups[i].group_id == group_id) {
+            group_idx = i;
+            break;
+        }
+    }
+    if (group_idx == -1) {
+        pthread_mutex_unlock(&groups_mutex);
+        return 0;  // 群不存在
+    }
+
+    // 检查是否已在群内
+    for (int i = 0; i < groups[group_idx].member_count; i++) {
+        if (strcmp(groups[group_idx].members[i], username) == 0) {
+            pthread_mutex_unlock(&groups_mutex);
+            return 0;  // 已在群内
+        }
+    }
+
+    // 加入群聊（不超过最大成员数）
+    if (groups[group_idx].member_count >= 10) {
+        pthread_mutex_unlock(&groups_mutex);
+        return 0;  // 群成员满
+    }
+    strncpy(groups[group_idx].members[groups[group_idx].member_count], username, 49);
+    groups[group_idx].members[groups[group_idx].member_count][49] = '\0';
+    groups[group_idx].member_count++;
+
+    pthread_mutex_unlock(&groups_mutex);
+    return 1;
+}
+
+// 获取群列表
+void get_group_list(char *list) {
+    pthread_mutex_lock(&groups_mutex);
+    strcpy(list, "群聊列表：\n");
+    char temp[100];
+    for (int i = 0; i < MAX_GROUPS; i++) {
+        if (groups[i].is_active) {
+            snprintf(temp, sizeof(temp), "%d. 群ID：%d | 群名：%s | 成员数：%d\n",
+                     i + 1, groups[i].group_id, groups[i].group_name, groups[i].member_count);
+            strcat(list, temp);
+        }
+    }
+    if (group_count == 0) {
+        strcat(list, "暂无可用群聊\n");
+    }
+    pthread_mutex_unlock(&groups_mutex);
+}
+
+// 群聊消息广播
+void broadcast_group_message(const char *message, int group_id, const char *sender_username) {
+    pthread_mutex_lock(&groups_mutex);
+    int group_idx = -1;
+    for (int i = 0; i < MAX_GROUPS; i++) {
+        if (groups[i].is_active && groups[i].group_id == group_id) {
+            group_idx = i;
+            break;
+        }
+    }
+    if (group_idx == -1) {
+        pthread_mutex_unlock(&groups_mutex);
+        return;
+    }
+
+    // 格式化消息
+    char formatted_msg[BUFFER_SIZE];
+    snprintf(formatted_msg, BUFFER_SIZE, "[群聊-%s] %s: %s",
+             groups[group_idx].group_name, sender_username, message);
+
+    // 发给群内所有在线成员
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < groups[group_idx].member_count; i++) {
+        const char *member = groups[group_idx].members[i];
+        for (int j = 0; j < MAX_CLIENTS; j++) {
+            if (clients[j].is_active && strcmp(clients[j].username, member) == 0) {
+                send(clients[j].socket, formatted_msg, strlen(formatted_msg), 0);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    pthread_mutex_unlock(&groups_mutex);
 }
 
 // 处理客户端
@@ -219,7 +352,8 @@ void *handle_client(void *arg) {
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!clients[i].is_active) {
                 clients[i].socket = client_socket;
-                strcpy(clients[i].username, username);
+                strncpy(clients[i].username, username, 49);
+                clients[i].username[49] = '\0';
                 clients[i].is_active = 1;
                 client_count++;
                 break;
@@ -236,15 +370,52 @@ void *handle_client(void *arg) {
         
         if (strcmp(buffer, "/exit") == 0) break;
 
-        // 支持两种格式：1. @目标用户:消息（强制指定） 2. 目标用户:消息（默认目标）
+        // 处理群聊相关命令
+        char group_name[50], group_id_str[10];
+        if (sscanf(buffer, "/create_group %[^\n]", group_name) == 1) {
+            int group_id = create_group(group_name, username);
+            char resp[BUFFER_SIZE];
+            if (group_id != -1) {
+                snprintf(resp, BUFFER_SIZE, "创建群聊成功！群ID：%d，群名：%s", group_id, group_name);
+            } else {
+                strcpy(resp, "创建群聊失败：群数量已达上限");
+            }
+            send(client_socket, resp, strlen(resp), 0);
+            continue;
+        } else if (strcmp(buffer, "/get_group_list") == 0) {
+            char group_list[BUFFER_SIZE];
+            get_group_list(group_list);
+            send(client_socket, group_list, strlen(group_list), 0);
+            continue;
+        } else if (sscanf(buffer, "/join_group %s", group_id_str) == 1) {
+            int group_id = atoi(group_id_str);
+            int ret = join_group(group_id, username);
+            char resp[BUFFER_SIZE];
+            if (ret == 1) {
+                snprintf(resp, BUFFER_SIZE, "加入群聊（ID：%d）成功", group_id);
+            } else {
+                strcpy(resp, "加入群聊失败：群不存在/已在群内/成员满/用户名未注册");
+            }
+            send(client_socket, resp, strlen(resp), 0);
+            continue;
+        }
+
+        // 群聊消息格式：#群ID:消息
+        int group_id;
+        char group_msg[BUFFER_SIZE];
+        if (sscanf(buffer, "#%d:%[^\n]", &group_id, group_msg) == 2) {
+            broadcast_group_message(group_msg, group_id, username);
+            continue;
+        }
+
+        // 私聊消息格式
         char target[50], msg[BUFFER_SIZE];
-        if (sscanf(buffer, "@%49[^:]:%[^\n]", target, msg) == 2) {
-            forward_message(msg, target, username, client_socket);
-        } else if (sscanf(buffer, "%49[^:]:%[^\n]", target, msg) == 2) {
+        if (sscanf(buffer, "@%49[^:]:%[^\n]", target, msg) == 2 || 
+            sscanf(buffer, "%49[^:]:%[^\n]", target, msg) == 2) {
             forward_message(msg, target, username, client_socket);
         } else {
-            send(client_socket, "消息格式错误！可输入：\n1. 直接输入消息（发给当前选择的用户）\n2. @目标用户:消息（临时切换目标）", 
-                 strlen("消息格式错误！可输入：\n1. 直接输入消息（发给当前选择的用户）\n2. @目标用户:消息（临时切换目标）"), 0);
+            send(client_socket, "消息格式错误！\n1. 私聊：@目标用户:消息 或 目标用户:消息\n2. 群聊：#群ID:消息", 
+                 strlen("消息格式错误！\n1. 私聊：@目标用户:消息 或 目标用户:消息\n2. 群聊：#群ID:消息"), 0);
         }
     }
 
@@ -274,6 +445,13 @@ int main() {
     // 初始化客户端列表
     memset(clients, 0, sizeof(clients));
     for (int i = 0; i < MAX_CLIENTS; i++) clients[i].is_active = 0;
+
+    // 初始化群列表
+    memset(groups, 0, sizeof(groups));
+    for (int i = 0; i < MAX_GROUPS; i++) {
+        groups[i].is_active = 0;
+        groups[i].member_count = 0;
+    }
 
     // 创建socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {

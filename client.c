@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 
 #define BUFFER_SIZE 1024
-#define SERVER_IP "127.0.0.1"  // 服务器IP123.249.105.161，本地测试用127.0.0.1
+#define SERVER_IP "123.249.105.161"  // 服务器IP123.249.105.161，本地测试用127.0.0.1
 #define PORT 8888
 
 int client_socket;
